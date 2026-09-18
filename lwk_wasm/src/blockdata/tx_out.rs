@@ -1,8 +1,6 @@
 //! Liquid transaction output
 
-use crate::{Address, AssetId, Network, Script};
-#[cfg(feature = "simplicity")]
-use crate::{Error, SecretKey, TxOutSecrets};
+use crate::{Address, AssetId, Error, Network, Script, SecretKey, TxOutSecrets};
 
 use lwk_wollet::elements::{self, confidential, encode::serialize, hex::ToHex, TxOutWitness};
 
@@ -104,11 +102,20 @@ impl TxOut {
     }
 
     /// Unblind the output using the given secret key
-    #[cfg(feature = "simplicity")]
     pub fn unblind(&self, secret_key: &SecretKey) -> Result<TxOutSecrets, Error> {
         Ok(self
             .inner
             .unblind(&lwk_wollet::EC, secret_key.into())
+            .map(Into::into)?)
+    }
+
+    /// Unblind the output using 32-byte private blinding key
+    #[wasm_bindgen(js_name = unblindWithPrivateKey)]
+    pub fn unblind_with_private_key(&self, key_bytes: &[u8]) -> Result<TxOutSecrets, Error> {
+        let sk = lwk_wollet::elements::bitcoin::secp256k1::SecretKey::from_slice(key_bytes)?;
+        Ok(self
+            .inner
+            .unblind(&lwk_wollet::EC, sk)
             .map(Into::into)?)
     }
 }

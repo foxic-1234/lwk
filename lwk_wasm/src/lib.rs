@@ -37,7 +37,6 @@ mod pset_details;
 #[cfg(feature = "simplicity")]
 mod public_key;
 mod registry;
-#[cfg(feature = "simplicity")]
 mod secret_key;
 #[cfg(all(feature = "serial", target_arch = "wasm32"))]
 mod serial;
@@ -123,7 +122,6 @@ pub use pset_details::{Issuance, PsetDetails};
 #[cfg(feature = "simplicity")]
 pub use public_key::PublicKey;
 pub use registry::{AssetMeta, Registry, RegistryPost};
-#[cfg(feature = "simplicity")]
 pub use secret_key::SecretKey;
 pub use signer::Signer;
 pub use store::{JsStorage, JsStoreLink, JsTestStore};
