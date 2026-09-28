@@ -67,18 +67,22 @@ where
 
 /// Estimate virtual size (vSize) for a confidential Taproot sweep transaction.
 #[wasm_bindgen(js_name = estimateSweepVsize)]
-pub fn estimate_sweep_vsize(num_inputs: u32) -> u32 {
-    1225 + 58 * num_inputs
+pub fn estimate_sweep_vsize(num_inputs: u32, has_change: Option<bool>) -> u32 {
+    let base = if has_change.unwrap_or(false) { 1505 } else { 1225 };
+    base + 58 * num_inputs
 }
 
 /// Construct, blind, sign and extract a consensus-encoded raw transaction (hex)
-/// that sweeps one or more Silent Payment stealth UTXOs into a primary wallet confidential address.
+/// that sweeps one or more Silent Payment stealth UTXOs into a primary wallet confidential address,
+/// or sends a specific amount to a destination address with change returning to a change address.
 #[wasm_bindgen(js_name = createSweepTransaction)]
 pub fn create_sweep_transaction(
     utxos_json: &str,
     destination_address: &str,
     fee_sats: u64,
     network: &str,
+    send_amount_sats: Option<u64>,
+    change_address: Option<String>,
 ) -> Result<String, Error> {
     let net = match network.to_ascii_lowercase().as_str() {
         "mainnet" | "liquid" => Network::Liquid,
@@ -167,7 +171,19 @@ pub fn create_sweep_transaction(
             "Total input amount ({total_sats} sats) is less than or equal to fee ({fee_sats} sats)"
         )));
     }
-    let send_sats = total_sats - fee_sats;
+    let max_send = total_sats - fee_sats;
+    let (send_sats, change_sats) = match send_amount_sats {
+        Some(amt) if amt > 0 && amt < max_send => {
+            let change = max_send - amt;
+            (amt, Some(change))
+        }
+        Some(amt) if amt > max_send => {
+            return Err(Error::Generic(format!(
+                "Send amount ({amt} sats) exceeds available balance ({max_send} sats after {fee_sats} fee)"
+            )));
+        }
+        _ => (max_send, None),
+    };
 
     let dest_output = Output {
         script_pubkey: dest_script,
@@ -178,6 +194,26 @@ pub fn create_sweep_transaction(
         ..Default::default()
     };
     pset.add_output(dest_output);
+
+    if let Some(chg_sats) = change_sats {
+        let chg_addr_str = change_address.as_deref().ok_or_else(|| {
+            Error::Generic("Change address must be provided for partial spend".to_string())
+        })?;
+        let chg_addr = Address::from_str(chg_addr_str)
+            .map_err(|e| Error::Generic(format!("Invalid change address: {e}")))?;
+        let chg_script = chg_addr.script_pubkey();
+        let chg_blinding_pk = chg_addr.blinding_pubkey;
+
+        let change_output = Output {
+            script_pubkey: chg_script,
+            amount: Some(chg_sats),
+            asset: Some(*policy_asset),
+            blinding_key: chg_blinding_pk.map(lwk_wollet::bitcoin::PublicKey::new),
+            blinder_index: if chg_blinding_pk.is_some() { Some(0) } else { None },
+            ..Default::default()
+        };
+        pset.add_output(change_output);
+    }
 
     let fee_output = Output {
         script_pubkey: Script::default(),
@@ -236,20 +272,58 @@ mod tests {
         ]"#;
 
         let fee_sats = 500;
-        let tx_hex = create_sweep_transaction(utxo_json, dest_address, fee_sats, "testnet").unwrap();
+        let tx_hex = create_sweep_transaction(utxo_json, dest_address, fee_sats, "testnet", None, None).unwrap();
         assert!(!tx_hex.is_empty());
-        // Verify that tx deserializes as a valid elements Transaction
         let tx_bytes = Vec::<u8>::from_hex(&tx_hex).unwrap();
         let tx: lwk_wollet::elements::Transaction = lwk_wollet::elements::encode::deserialize(&tx_bytes).unwrap();
         assert_eq!(tx.input.len(), 1);
         assert_eq!(tx.output.len(), 2);
-        // First output is blinded (has rangeproof + surjection proof)
         assert!(tx.output[0].witness.rangeproof.is_some());
         assert!(tx.output[0].witness.surjection_proof.is_some());
-        // Second output is explicit fee
         assert!(tx.output[1].is_fee());
         assert_eq!(tx.output[1].minimum_value(), fee_sats);
-        // Input has Taproot key-path 64-byte signature
+        assert_eq!(tx.input[0].witness.script_witness.len(), 1);
+        assert_eq!(tx.input[0].witness.script_witness[0].len(), 64);
+    }
+
+    #[test]
+    fn test_create_partial_sweep_transaction() {
+        let dest_address = "tlq1qq2xvpcvfup5j8zscjq05u2wxxjcyewk7979f3mmz5l7uw5pqmx6xf5xy50hsn6vhkm5euwt72x878eq6zxx2z58hd7zrsg9qn";
+        let change_address = "tlq1qq2xvpcvfup5j8zscjq05u2wxxjcyewk7979f3mmz5l7uw5pqmx6xf5xy50hsn6vhkm5euwt72x878eq6zxx2z58hd7zrsg9qn";
+        let utxo_json = r#"[
+            {
+                "txid": "0000000000000000000000000000000000000000000000000000000000000001",
+                "vout": 0,
+                "amountSats": 100000,
+                "assetId": "144c654344aa716d6f3abcc1ca90e5641e4e2a7f633bc09fe3baf64585819a49",
+                "assetBlindingFactor": "0000000000000000000000000000000000000000000000000000000000000002",
+                "valueBlindingFactor": "0000000000000000000000000000000000000000000000000000000000000003",
+                "spendingPrivateKey": "0000000000000000000000000000000000000000000000000000000000000004"
+            }
+        ]"#;
+
+        let fee_sats = 500;
+        let send_sats = 40000;
+        let tx_hex = create_sweep_transaction(
+            utxo_json,
+            dest_address,
+            fee_sats,
+            "testnet",
+            Some(send_sats),
+            Some(change_address.to_string()),
+        ).unwrap();
+
+        assert!(!tx_hex.is_empty());
+        let tx_bytes = Vec::<u8>::from_hex(&tx_hex).unwrap();
+        let tx: lwk_wollet::elements::Transaction = lwk_wollet::elements::encode::deserialize(&tx_bytes).unwrap();
+        assert_eq!(tx.input.len(), 1);
+        assert_eq!(tx.output.len(), 3); // output 0: send_sats, output 1: change (59500), output 2: fee (500)
+        assert!(tx.output[0].witness.rangeproof.is_some());
+        assert!(tx.output[0].witness.surjection_proof.is_some());
+        assert!(tx.output[1].witness.rangeproof.is_some());
+        assert!(tx.output[1].witness.surjection_proof.is_some());
+        assert!(tx.output[2].is_fee());
+        assert_eq!(tx.output[2].minimum_value(), fee_sats);
         assert_eq!(tx.input[0].witness.script_witness.len(), 1);
         assert_eq!(tx.input[0].witness.script_witness[0].len(), 64);
     }
