@@ -74,11 +74,57 @@ where
     }
 }
 
-/// Estimate virtual size (vSize) for a confidential Taproot sweep transaction.
+/// Network explicit dust limit threshold in satoshis for Liquid (Elements).
+/// Any change output below this limit must not be created, because Liquid nodes
+/// reject dust outputs or render them uneconomical (spending fee exceeds value).
+/// If change is below this threshold, it is absorbed into the miner fee.
+pub const DUST_LIMIT_SATS: u64 = 600;
+
+/// Base virtual size for a confidential transaction with 1 confidential recipient output + 1 explicit fee output.
+/// In Elements/Liquid, 1 confidential P2TR output with RangeProof Bulletproof and SurjectionProof
+/// has a discount-adjusted vSize of ~1169 vB, plus base transaction overhead and explicit fee output (~56 vB) = ~1225 vB.
+pub const VSIZE_BASE_1_CONFIDENTIAL_OUT: u32 = 1225;
+
+/// Virtual size for an additional confidential change output (with ELIP-200 CT discount).
+pub const VSIZE_CONFIDENTIAL_CHANGE_OUT: u32 = 280;
+
+/// Virtual size per P2TR (Taproot key-path) input:
+/// Non-witness: 41 bytes (outpoint 36B + scriptSig len 1B + sequence 4B) * 4 = 164 WU.
+/// Witness: 1 stack item count (1B) + 1 length byte (1B) + 64B Schnorr sig = 66 WU.
+/// Total: 164 + 66 = 230 WU -> ceil(230 / 4) = 58 vB.
+pub const VSIZE_P2TR_INPUT: u32 = 58;
+
+/// Virtual size per P2WPKH (Segwit v0) input:
+/// Non-witness: 41 bytes * 4 = 164 WU.
+/// Witness: 1 stack item count (1B) + 1 len (1B) + 72B DER ECDSA sig + 1 len (1B) + 33B compressed pubkey = 108 WU.
+/// Total: 164 + 108 = 272 WU -> ceil(272 / 4) = 68.25 -> 69 vB.
+pub const VSIZE_P2WPKH_INPUT: u32 = 69;
+
+/// Calculate virtual size (vSize) for a confidential sweep transaction with specific input types.
+pub fn calculate_sweep_vsize(
+    num_p2tr_inputs: u32,
+    num_p2wpkh_inputs: u32,
+    has_change: bool,
+) -> u32 {
+    let mut base = VSIZE_BASE_1_CONFIDENTIAL_OUT;
+    if has_change {
+        base += VSIZE_CONFIDENTIAL_CHANGE_OUT;
+    }
+    base + (num_p2tr_inputs * VSIZE_P2TR_INPUT) + (num_p2wpkh_inputs * VSIZE_P2WPKH_INPUT)
+}
+
+/// Estimate virtual size (vSize) for a confidential sweep transaction.
+/// Supports both legacy JS call `estimateSweepVsize(num_inputs, has_change)` and granular
+/// `estimateSweepVsize(num_inputs, has_change, num_p2wpkh_inputs)`.
 #[wasm_bindgen(js_name = estimateSweepVsize)]
-pub fn estimate_sweep_vsize(num_inputs: u32, has_change: Option<bool>) -> u32 {
-    let base = if has_change.unwrap_or(false) { 1505 } else { 1225 };
-    base + 58 * num_inputs
+pub fn estimate_sweep_vsize(
+    num_inputs: u32,
+    has_change: Option<bool>,
+    num_p2wpkh_inputs: Option<u32>,
+) -> u32 {
+    let p2wpkh = num_p2wpkh_inputs.unwrap_or(0).min(num_inputs);
+    let p2tr = num_inputs.saturating_sub(p2wpkh);
+    calculate_sweep_vsize(p2tr, p2wpkh, has_change.unwrap_or(false))
 }
 
 /// Construct, blind, sign and extract a consensus-encoded raw transaction (hex)
@@ -196,21 +242,27 @@ pub fn create_sweep_transaction(
         )));
     }
     let max_send = total_sats - fee_sats;
-    let (send_sats, change_sats) = match send_amount_sats {
+    let (send_sats, change_sats, final_fee_sats) = match send_amount_sats {
         Some(0) => {
             return Err(Error::Generic("Send amount cannot be 0 sats".into()));
         }
         Some(amt) if amt < max_send => {
             let change = max_send - amt;
-            (amt, Some(change))
+            if change < DUST_LIMIT_SATS {
+                // Change is below dust threshold: absorb into miner fee instead of creating
+                // an uneconomical output that Liquid nodes would reject as dust.
+                (amt, None, fee_sats + change)
+            } else {
+                (amt, Some(change), fee_sats)
+            }
         }
-        Some(amt) if amt == max_send => (max_send, None),
+        Some(amt) if amt == max_send => (max_send, None, fee_sats),
         Some(amt) => {
             return Err(Error::Generic(format!(
                 "Send amount ({amt} sats) exceeds available balance ({max_send} sats after {fee_sats} fee)"
             )));
         }
-        None => (max_send, None),
+        None => (max_send, None, fee_sats),
     };
 
     let dest_output = Output {
@@ -245,7 +297,7 @@ pub fn create_sweep_transaction(
 
     let fee_output = Output {
         script_pubkey: Script::default(),
-        amount: Some(fee_sats),
+        amount: Some(final_fee_sats),
         asset: Some(*policy_asset),
         ..Default::default()
     };
@@ -361,5 +413,61 @@ mod tests {
         assert_eq!(tx.output[2].minimum_value(), fee_sats);
         assert_eq!(tx.input[0].witness.script_witness.len(), 1);
         assert_eq!(tx.input[0].witness.script_witness[0].len(), 64);
+    }
+
+    #[test]
+    fn test_create_partial_sweep_dust_change_absorbed() {
+        let dest_address = "tlq1qq2xvpcvfup5j8zscjq05u2wxxjcyewk7979f3mmz5l7uw5pqmx6xf5xy50hsn6vhkm5euwt72x878eq6zxx2z58hd7zrsg9qn";
+        let utxo_json = r#"[
+            {
+                "txid": "0000000000000000000000000000000000000000000000000000000000000001",
+                "vout": 0,
+                "amountSats": 100000,
+                "assetId": "144c654344aa716d6f3abcc1ca90e5641e4e2a7f633bc09fe3baf64585819a49",
+                "assetBlindingFactor": "0000000000000000000000000000000000000000000000000000000000000002",
+                "valueBlindingFactor": "0000000000000000000000000000000000000000000000000000000000000003",
+                "spendingPrivateKey": "0000000000000000000000000000000000000000000000000000000000000004"
+            }
+        ]"#;
+
+        let fee_sats = 500;
+        // Total = 100000. Fee = 500 -> max_send = 99500.
+        // Send = 99200 -> raw change = 300 sats (< DUST_LIMIT_SATS = 600).
+        // Change must be absorbed into fee: final_fee = 500 + 300 = 800 sats.
+        // No change address needed and no change output created.
+        let send_sats = 99200;
+        let tx_hex = create_sweep_transaction(
+            utxo_json,
+            dest_address,
+            fee_sats,
+            "testnet",
+            Some(send_sats),
+            None,
+        ).unwrap();
+
+        assert!(!tx_hex.is_empty());
+        let tx_bytes = Vec::<u8>::from_hex(&tx_hex).unwrap();
+        let tx: lwk_wollet::elements::Transaction = lwk_wollet::elements::encode::deserialize(&tx_bytes).unwrap();
+        assert_eq!(tx.input.len(), 1);
+        assert_eq!(tx.output.len(), 2); // Only recipient + fee, NO change output
+        assert!(tx.output[0].witness.rangeproof.is_some());
+        assert!(tx.output[1].is_fee());
+        assert_eq!(tx.output[1].minimum_value(), 800); // 500 + 300 dust change absorbed
+    }
+
+    #[test]
+    fn test_estimate_sweep_vsize_segwit_vs_taproot() {
+        // 1 P2TR input, no change: 1225 + 58 = 1283
+        assert_eq!(estimate_sweep_vsize(1, None, None), 1283);
+        assert_eq!(estimate_sweep_vsize(1, Some(false), Some(0)), 1283);
+
+        // 1 P2WPKH input, no change: 1225 + 69 = 1294
+        assert_eq!(estimate_sweep_vsize(1, Some(false), Some(1)), 1294);
+
+        // 1 P2TR input + change: 1225 + 280 + 58 = 1563
+        assert_eq!(estimate_sweep_vsize(1, Some(true), None), 1563);
+
+        // 2 inputs (1 P2TR + 1 P2WPKH), with change: 1225 + 280 + 58 + 69 = 1632
+        assert_eq!(estimate_sweep_vsize(2, Some(true), Some(1)), 1632);
     }
 }
