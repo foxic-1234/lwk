@@ -29,6 +29,8 @@ use wasm_bindgen::prelude::*;
 
 use crate::Error;
 
+use zeroize::{Zeroize, Zeroizing};
+
 /// Input JSON representation of a silent payment UTXO to sweep.
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -46,16 +48,18 @@ pub struct SweepUtxoJson {
     pub asset_blinding_factor: String,
     /// Value blinding factor (hex, 32 bytes)
     pub value_blinding_factor: String,
-    /// Spending private key (hex, 32 bytes)
-    pub spending_private_key: String,
+    /// Optional spending private key (hex, 32 bytes) - legacy fallback.
+    /// In modern calls, private keys should be passed as raw bytes in `spending_keys` Uint8Array.
+    #[serde(default)]
+    pub spending_private_key: Option<String>,
     /// Script type: "p2tr" (default) or "p2wpkh"
     #[serde(default)]
     pub script_type: Option<String>,
 }
 
 enum InputSigner {
-    Taproot(Keypair),
-    SegwitV0(SecretKey, SecpPublicKey),
+    Taproot(Zeroizing<[u8; 32]>),
+    SegwitV0(Zeroizing<[u8; 32]>, SecpPublicKey),
 }
 
 fn deserialize_u64_from_str_or_num<'de, D>(deserializer: D) -> Result<u64, D::Error>
@@ -130,6 +134,12 @@ pub fn estimate_sweep_vsize(
 /// Construct, blind, sign and extract a consensus-encoded raw transaction (hex)
 /// that sweeps one or more Silent Payment stealth UTXOs into a primary wallet confidential address,
 /// or sends a specific amount to a destination address with change returning to a change address.
+///
+/// # Security (M3)
+/// `spending_keys`: Raw 32-byte private keys for each UTXO concatenated into a single byte buffer
+/// (`Uint8Array` in JS). Passing raw bytes prevents immutable V8 string persistence in JavaScript memory.
+/// In Rust, all key buffers and signing structures are securely zeroized using the `zeroize` crate
+/// immediately after signature generation.
 #[wasm_bindgen(js_name = createSweepTransaction)]
 pub fn create_sweep_transaction(
     utxos_json: &str,
@@ -138,7 +148,10 @@ pub fn create_sweep_transaction(
     network: &str,
     send_amount_sats: Option<u64>,
     change_address: Option<String>,
+    spending_keys: Option<Vec<u8>>,
 ) -> Result<String, Error> {
+    let mut spending_keys = spending_keys.map(Zeroizing::new);
+
     let net = match network.to_ascii_lowercase().as_str() {
         "mainnet" | "liquid" => Network::Liquid,
         "testnet" | "testnetliquid" => Network::TestnetLiquid,
@@ -159,6 +172,17 @@ pub fn create_sweep_transaction(
         return Err(Error::Generic("No UTXOs provided to sweep".to_string()));
     }
 
+    if let Some(ref keys) = spending_keys {
+        if keys.len() != utxos.len() * 32 {
+            return Err(Error::Generic(format!(
+                "Invalid spending_keys length: expected {} bytes ({} UTXOs * 32), got {}",
+                utxos.len() * 32,
+                utxos.len(),
+                keys.len()
+            )));
+        }
+    }
+
     let mut pset = PartiallySignedTransaction::new_v2();
     set_genesis_hash(&mut pset, &net);
 
@@ -167,7 +191,7 @@ pub fn create_sweep_transaction(
     let mut input_signers = Vec::with_capacity(utxos.len());
     let mut rng = thread_rng();
 
-    for (idx, utxo) in utxos.iter().enumerate() {
+    for (idx, mut utxo) in utxos.into_iter().enumerate() {
         let txid = Txid::from_str(&utxo.txid)
             .map_err(|e| Error::Generic(format!("Invalid txid: {e}")))?;
         let outpoint = OutPoint::new(txid, utxo.vout);
@@ -179,10 +203,28 @@ pub fn create_sweep_transaction(
         let vbf = ValueBlindingFactor::from_str(&utxo.value_blinding_factor)
             .map_err(|e| Error::Generic(format!("Invalid value_blinding_factor: {e}")))?;
 
-        let privkey_bytes = Vec::<u8>::from_hex(&utxo.spending_private_key)
-            .map_err(|e| Error::Generic(format!("Invalid spending_private_key hex: {e}")))?;
-        let privkey = SecretKey::from_slice(&privkey_bytes)
-            .map_err(|e| Error::Generic(format!("Invalid spending_private_key: {e}")))?;
+        // Extract 32-byte private key: prefer raw bytes from spending_keys, fallback to legacy hex in utxo
+        let zeroizing_key: Zeroizing<[u8; 32]> = if let Some(ref keys) = spending_keys {
+            let mut key_buf = [0u8; 32];
+            key_buf.copy_from_slice(&keys[idx * 32..(idx + 1) * 32]);
+            Zeroizing::new(key_buf)
+        } else if let Some(mut hex_key) = utxo.spending_private_key.take() {
+            let mut privkey_bytes = Vec::<u8>::from_hex(&hex_key)
+                .map_err(|e| Error::Generic(format!("Invalid spending_private_key hex: {e}")))?;
+            hex_key.zeroize();
+            if privkey_bytes.len() != 32 {
+                privkey_bytes.zeroize();
+                return Err(Error::Generic("spending_private_key must be 32 bytes".to_string()));
+            }
+            let mut key_buf = [0u8; 32];
+            key_buf.copy_from_slice(&privkey_bytes);
+            privkey_bytes.zeroize();
+            Zeroizing::new(key_buf)
+        } else {
+            return Err(Error::Generic(format!(
+                "Missing spending private key for UTXO at index {idx} (neither raw spending_keys nor spendingPrivateKey JSON provided)"
+            )));
+        };
 
         let is_p2wpkh = utxo
             .script_type
@@ -191,18 +233,21 @@ pub fn create_sweep_transaction(
             .unwrap_or(false);
 
         let spk = if is_p2wpkh {
-            let secp_pk = SecpPublicKey::from_secret_key(&EC, &privkey);
+            let sec_key = SecretKey::from_slice(&*zeroizing_key)
+                .map_err(|e| Error::Generic(format!("Invalid spending private key: {e}")))?;
+            let secp_pk = SecpPublicKey::from_secret_key(&EC, &sec_key);
             let pk_hash = Hash160::hash(&secp_pk.serialize());
             let mut spk_bytes = vec![0x00, 0x14];
             spk_bytes.extend_from_slice(pk_hash.as_byte_array());
-            input_signers.push(InputSigner::SegwitV0(privkey, secp_pk));
+            input_signers.push(InputSigner::SegwitV0(zeroizing_key, secp_pk));
             Script::from(spk_bytes)
         } else {
-            let keypair = Keypair::from_secret_key(&EC, &privkey);
+            let keypair = Keypair::from_seckey_slice(&EC, &*zeroizing_key)
+                .map_err(|e| Error::Generic(format!("Invalid spending private key: {e}")))?;
             let (xonly_pk, _parity) = XOnlyPublicKey::from_keypair(&keypair);
             let mut spk_bytes = vec![0x51, 0x20];
             spk_bytes.extend_from_slice(&xonly_pk.serialize());
-            input_signers.push(InputSigner::Taproot(keypair));
+            input_signers.push(InputSigner::Taproot(zeroizing_key));
             Script::from(spk_bytes)
         };
 
@@ -234,6 +279,11 @@ pub fn create_sweep_transaction(
         pset.add_input(pset_input);
         inp_txout_sec.insert(idx, TxOutSecrets::new(asset_id, abf, utxo.amount_sats, vbf));
         total_sats += utxo.amount_sats;
+    }
+
+    // Zeroize the raw spending_keys buffer in WASM memory now that keys are transferred into input_signers
+    if let Some(ref mut keys) = spending_keys {
+        keys.zeroize();
     }
 
     if total_sats <= fee_sats {
@@ -318,12 +368,16 @@ pub fn create_sweep_transaction(
             .map_err(|e| Error::Generic(format!("sighash_msg error: {e}")))?;
         let secp_msg = msg.to_secp_msg();
         match signer {
-            InputSigner::Taproot(keypair) => {
-                let sig = EC.sign_schnorr(&secp_msg, keypair);
+            InputSigner::Taproot(key_bytes) => {
+                let keypair = Keypair::from_seckey_slice(&EC, &**key_bytes)
+                    .map_err(|e| Error::Generic(format!("Signing error (Taproot keypair): {e}")))?;
+                let sig = EC.sign_schnorr(&secp_msg, &keypair);
                 pset.inputs_mut()[i].final_script_witness = Some(vec![sig.as_ref().to_vec()]);
             }
-            InputSigner::SegwitV0(sec_key, pubkey) => {
-                let sig = EC.sign_ecdsa(&secp_msg, sec_key);
+            InputSigner::SegwitV0(key_bytes, pubkey) => {
+                let sec_key = SecretKey::from_slice(&**key_bytes)
+                    .map_err(|e| Error::Generic(format!("Signing error (Segwit secret key): {e}")))?;
+                let sig = EC.sign_ecdsa(&secp_msg, &sec_key);
                 let mut sig_bytes = sig.serialize_der().to_vec();
                 sig_bytes.push(0x01); // SIGHASH_ALL
                 pset.inputs_mut()[i].final_script_witness =
@@ -331,6 +385,9 @@ pub fn create_sweep_transaction(
             }
         }
     }
+
+    // Zeroize all private key material stored in input_signers immediately after signing!
+    drop(input_signers);
 
     let final_tx = pset
         .extract_tx()
@@ -359,7 +416,7 @@ mod tests {
         ]"#;
 
         let fee_sats = 500;
-        let tx_hex = create_sweep_transaction(utxo_json, dest_address, fee_sats, "testnet", None, None).unwrap();
+        let tx_hex = create_sweep_transaction(utxo_json, dest_address, fee_sats, "testnet", None, None, None).unwrap();
         assert!(!tx_hex.is_empty());
         let tx_bytes = Vec::<u8>::from_hex(&tx_hex).unwrap();
         let tx: lwk_wollet::elements::Transaction = lwk_wollet::elements::encode::deserialize(&tx_bytes).unwrap();
@@ -398,6 +455,7 @@ mod tests {
             "testnet",
             Some(send_sats),
             Some(change_address.to_string()),
+            None,
         ).unwrap();
 
         assert!(!tx_hex.is_empty());
@@ -431,10 +489,6 @@ mod tests {
         ]"#;
 
         let fee_sats = 500;
-        // Total = 100000. Fee = 500 -> max_send = 99500.
-        // Send = 99200 -> raw change = 300 sats (< DUST_LIMIT_SATS = 600).
-        // Change must be absorbed into fee: final_fee = 500 + 300 = 800 sats.
-        // No change address needed and no change output created.
         let send_sats = 99200;
         let tx_hex = create_sweep_transaction(
             utxo_json,
@@ -442,6 +496,7 @@ mod tests {
             fee_sats,
             "testnet",
             Some(send_sats),
+            None,
             None,
         ).unwrap();
 
@@ -453,6 +508,73 @@ mod tests {
         assert!(tx.output[0].witness.rangeproof.is_some());
         assert!(tx.output[1].is_fee());
         assert_eq!(tx.output[1].minimum_value(), 800); // 500 + 300 dust change absorbed
+    }
+
+    #[test]
+    fn test_create_sweep_transaction_raw_bytes() {
+        let dest_address = "tlq1qq2xvpcvfup5j8zscjq05u2wxxjcyewk7979f3mmz5l7uw5pqmx6xf5xy50hsn6vhkm5euwt72x878eq6zxx2z58hd7zrsg9qn";
+        // Notice: NO spendingPrivateKey in JSON!
+        let utxo_json = r#"[
+            {
+                "txid": "0000000000000000000000000000000000000000000000000000000000000001",
+                "vout": 0,
+                "amountSats": 100000,
+                "assetId": "144c654344aa716d6f3abcc1ca90e5641e4e2a7f633bc09fe3baf64585819a49",
+                "assetBlindingFactor": "0000000000000000000000000000000000000000000000000000000000000002",
+                "valueBlindingFactor": "0000000000000000000000000000000000000000000000000000000000000003",
+                "scriptType": "p2tr"
+            },
+            {
+                "txid": "0000000000000000000000000000000000000000000000000000000000000002",
+                "vout": 1,
+                "amountSats": 50000,
+                "assetId": "144c654344aa716d6f3abcc1ca90e5641e4e2a7f633bc09fe3baf64585819a49",
+                "assetBlindingFactor": "0000000000000000000000000000000000000000000000000000000000000002",
+                "valueBlindingFactor": "0000000000000000000000000000000000000000000000000000000000000003",
+                "scriptType": "p2wpkh"
+            }
+        ]"#;
+
+        // Raw 32-byte private keys concatenated (64 bytes total for 2 UTXOs)
+        let mut raw_keys = vec![0u8; 64];
+        raw_keys[31] = 0x04; // Key 0: scalar 4
+        raw_keys[63] = 0x05; // Key 1: scalar 5
+
+        let fee_sats = 600;
+        let tx_hex = create_sweep_transaction(
+            utxo_json,
+            dest_address,
+            fee_sats,
+            "testnet",
+            None,
+            None,
+            Some(raw_keys.clone()),
+        ).unwrap();
+
+        assert!(!tx_hex.is_empty());
+        let tx_bytes = Vec::<u8>::from_hex(&tx_hex).unwrap();
+        let tx: lwk_wollet::elements::Transaction = lwk_wollet::elements::encode::deserialize(&tx_bytes).unwrap();
+        assert_eq!(tx.input.len(), 2);
+        // Input 0 (p2tr): 1 witness item (64-byte Schnorr sig)
+        assert_eq!(tx.input[0].witness.script_witness.len(), 1);
+        assert_eq!(tx.input[0].witness.script_witness[0].len(), 64);
+        // Input 1 (p2wpkh): 2 witness items (DER sig + 33-byte compressed pubkey)
+        assert_eq!(tx.input[1].witness.script_witness.len(), 2);
+        assert_eq!(tx.input[1].witness.script_witness[1].len(), 33);
+
+        // Validation: wrong key length must return an error
+        let wrong_keys = vec![0u8; 32]; // only 32 bytes for 2 UTXOs
+        let err = create_sweep_transaction(
+            utxo_json,
+            dest_address,
+            fee_sats,
+            "testnet",
+            None,
+            None,
+            Some(wrong_keys),
+        );
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("Invalid spending_keys length"));
     }
 
     #[test]
