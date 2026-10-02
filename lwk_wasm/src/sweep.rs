@@ -11,15 +11,16 @@ use lwk_wollet::elements::encode::serialize;
 use lwk_wollet::elements::hex::{FromHex, ToHex};
 use lwk_wollet::elements::pset::{Input, Output, PartiallySignedTransaction};
 use lwk_wollet::elements::secp256k1_zkp::{
-    Generator, Keypair, Message, PedersenCommitment, RangeProof, SecretKey, SurjectionProof, Tag,
-    XOnlyPublicKey,
+    Generator, Keypair, PedersenCommitment, PublicKey as SecpPublicKey, RangeProof, SecretKey,
+    SurjectionProof, Tag, XOnlyPublicKey,
 };
 use lwk_wollet::elements::sighash::SighashCache;
 use lwk_wollet::elements::{
     Address, AssetId, BlindAssetProofs, BlindValueProofs, OutPoint, Script, TxOut, TxOutSecrets,
     TxOutWitness, Txid,
 };
-use lwk_wollet::elements_miniscript::psbt::{PsbtExt, PsbtSighashMsg};
+use lwk_wollet::elements_miniscript::psbt::PsbtExt;
+use lwk_wollet::hashes::hash160::Hash as Hash160;
 use lwk_wollet::hashes::Hash;
 use lwk_wollet::secp256k1::rand::thread_rng;
 use lwk_wollet::{Network, EC};
@@ -47,6 +48,14 @@ pub struct SweepUtxoJson {
     pub value_blinding_factor: String,
     /// Spending private key (hex, 32 bytes)
     pub spending_private_key: String,
+    /// Script type: "p2tr" (default) or "p2wpkh"
+    #[serde(default)]
+    pub script_type: Option<String>,
+}
+
+enum InputSigner {
+    Taproot(Keypair),
+    SegwitV0(SecretKey, SecpPublicKey),
 }
 
 fn deserialize_u64_from_str_or_num<'de, D>(deserializer: D) -> Result<u64, D::Error>
@@ -109,7 +118,7 @@ pub fn create_sweep_transaction(
 
     let mut total_sats: u64 = 0;
     let mut inp_txout_sec: HashMap<usize, TxOutSecrets> = HashMap::with_capacity(utxos.len());
-    let mut keypairs = Vec::with_capacity(utxos.len());
+    let mut input_signers = Vec::with_capacity(utxos.len());
     let mut rng = thread_rng();
 
     for (idx, utxo) in utxos.iter().enumerate() {
@@ -128,12 +137,28 @@ pub fn create_sweep_transaction(
             .map_err(|e| Error::Generic(format!("Invalid spending_private_key hex: {e}")))?;
         let privkey = SecretKey::from_slice(&privkey_bytes)
             .map_err(|e| Error::Generic(format!("Invalid spending_private_key: {e}")))?;
-        let keypair = Keypair::from_secret_key(&EC, &privkey);
-        let (xonly_pk, _parity) = XOnlyPublicKey::from_keypair(&keypair);
 
-        let mut spk_bytes = vec![0x51, 0x20];
-        spk_bytes.extend_from_slice(&xonly_pk.serialize());
-        let spk = Script::from(spk_bytes);
+        let is_p2wpkh = utxo
+            .script_type
+            .as_deref()
+            .map(|s| s.eq_ignore_ascii_case("p2wpkh"))
+            .unwrap_or(false);
+
+        let spk = if is_p2wpkh {
+            let secp_pk = SecpPublicKey::from_secret_key(&EC, &privkey);
+            let pk_hash = Hash160::hash(&secp_pk.serialize());
+            let mut spk_bytes = vec![0x00, 0x14];
+            spk_bytes.extend_from_slice(pk_hash.as_byte_array());
+            input_signers.push(InputSigner::SegwitV0(privkey, secp_pk));
+            Script::from(spk_bytes)
+        } else {
+            let keypair = Keypair::from_secret_key(&EC, &privkey);
+            let (xonly_pk, _parity) = XOnlyPublicKey::from_keypair(&keypair);
+            let mut spk_bytes = vec![0x51, 0x20];
+            spk_bytes.extend_from_slice(&xonly_pk.serialize());
+            input_signers.push(InputSigner::Taproot(keypair));
+            Script::from(spk_bytes)
+        };
 
         let asset_tag = Tag::from(asset_id.into_inner().to_byte_array());
         let asset_gen = Generator::new_blinded(&EC, asset_tag, abf.into_inner());
@@ -162,7 +187,6 @@ pub fn create_sweep_transaction(
 
         pset.add_input(pset_input);
         inp_txout_sec.insert(idx, TxOutSecrets::new(asset_id, abf, utxo.amount_sats, vbf));
-        keypairs.push(keypair);
         total_sats += utxo.amount_sats;
     }
 
@@ -173,16 +197,20 @@ pub fn create_sweep_transaction(
     }
     let max_send = total_sats - fee_sats;
     let (send_sats, change_sats) = match send_amount_sats {
-        Some(amt) if amt > 0 && amt < max_send => {
+        Some(0) => {
+            return Err(Error::Generic("Send amount cannot be 0 sats".into()));
+        }
+        Some(amt) if amt < max_send => {
             let change = max_send - amt;
             (amt, Some(change))
         }
-        Some(amt) if amt > max_send => {
+        Some(amt) if amt == max_send => (max_send, None),
+        Some(amt) => {
             return Err(Error::Generic(format!(
                 "Send amount ({amt} sats) exceeds available balance ({max_send} sats after {fee_sats} fee)"
             )));
         }
-        _ => (max_send, None),
+        None => (max_send, None),
     };
 
     let dest_output = Output {
@@ -232,16 +260,23 @@ pub fn create_sweep_transaction(
     let mut sighash_cache = SighashCache::new(&tx);
     let genesis_hash = lwk_common::get_genesis_hash(&pset);
 
-    for (i, keypair) in keypairs.iter().enumerate() {
+    for (i, signer) in input_signers.iter().enumerate() {
         let msg = pset
             .sighash_msg(i, &mut sighash_cache, None, genesis_hash)
             .map_err(|e| Error::Generic(format!("sighash_msg error: {e}")))?;
-        if let PsbtSighashMsg::TapSighash(hash) = msg {
-            let secp_msg = Message::from_digest(hash.to_byte_array());
-            let sig = EC.sign_schnorr(&secp_msg, keypair);
-            pset.inputs_mut()[i].final_script_witness = Some(vec![sig.as_ref().to_vec()]);
-        } else {
-            return Err(Error::Generic("Expected Taproot sighash".to_string()));
+        let secp_msg = msg.to_secp_msg();
+        match signer {
+            InputSigner::Taproot(keypair) => {
+                let sig = EC.sign_schnorr(&secp_msg, keypair);
+                pset.inputs_mut()[i].final_script_witness = Some(vec![sig.as_ref().to_vec()]);
+            }
+            InputSigner::SegwitV0(sec_key, pubkey) => {
+                let sig = EC.sign_ecdsa(&secp_msg, sec_key);
+                let mut sig_bytes = sig.serialize_der().to_vec();
+                sig_bytes.push(0x01); // SIGHASH_ALL
+                pset.inputs_mut()[i].final_script_witness =
+                    Some(vec![sig_bytes, pubkey.serialize().to_vec()]);
+            }
         }
     }
 
