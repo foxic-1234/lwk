@@ -208,7 +208,7 @@ impl TxBuilder {
     /// Adds external UTXOs to the transaction builder.
     #[wasm_bindgen(js_name = addExternalUtxos)]
     pub fn add_external_utxos(self, utxos: Vec<ExternalUtxo>) -> Result<TxBuilder, Error> {
-        let utxos: Vec<lwk_wollet::ExternalUtxo> = utxos.into_iter().map(Into::into).collect();
+        let utxos: Vec<lwk_wollet::ExternalUtxo> = utxos.iter().map(Into::into).collect();
         Ok(self.inner.add_external_utxos(utxos)?.into())
     }
 

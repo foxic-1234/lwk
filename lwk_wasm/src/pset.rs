@@ -105,31 +105,60 @@ impl Pset {
         Ok(())
     }
 
-    /// Sign a Taproot key-path input by index with a 32-byte secret key.
+    /// Sign a BIP-341 key-path input by index with a 32-byte secret key.
+    ///
+    /// The input's `witness_utxo` must be a v1 P2TR output whose output key is `secret_key·G`
+    /// (no taptweak is applied: BIP-352 outputs commit to the key directly). The signature is
+    /// verified against that output key before the final witness is written.
     #[wasm_bindgen(js_name = signTaprootKeypath)]
     pub fn sign_taproot_keypath(&mut self, index: usize, secret_key: &[u8]) -> Result<(), Error> {
-        if index >= self.inner.inputs().len() {
-            return Err(Error::Generic(format!("Input index {index} out of bounds")));
-        }
-        let keypair = lwk_wollet::elements::secp256k1_zkp::Keypair::from_seckey_slice(
-            &lwk_wollet::EC,
-            secret_key,
-        )
-        .map_err(|e| Error::Generic(format!("Invalid private key: {e}")))?;
+        use lwk_wollet::elements::secp256k1_zkp::{Keypair, XOnlyPublicKey};
 
-        let tx = self
+        let input = self
             .inner
-            .extract_tx()
-            .map_err(|e| Error::Generic(format!("extract_tx error before sign: {e}")))?;
-        let mut sighash_cache = lwk_wollet::elements::sighash::SighashCache::new(&tx);
-        let genesis_hash = lwk_common::get_genesis_hash(&self.inner);
-        let msg = self
-            .inner
-            .sighash_msg(index, &mut sighash_cache, None, genesis_hash)
-            .map_err(|e| Error::Generic(format!("sighash_msg error: {e}")))?;
-        let secp_msg = msg.to_secp_msg();
-        let sig = lwk_wollet::EC.sign_schnorr(&secp_msg, &keypair);
-        self.inner.inputs_mut()[index].final_script_witness = Some(vec![sig.as_ref().to_vec()]);
+            .inputs()
+            .get(index)
+            .ok_or_else(|| Error::Generic(format!("Input index {index} out of bounds")))?;
+        let spk = &input
+            .witness_utxo
+            .as_ref()
+            .ok_or_else(|| Error::Generic(format!("Input {index} has no witness_utxo")))?
+            .script_pubkey;
+        if !spk.is_v1_p2tr() {
+            return Err(Error::Generic(format!("Input {index} is not a v1 P2TR output")));
+        }
+        let output_key = XOnlyPublicKey::from_slice(&spk.as_bytes()[2..34])
+            .map_err(|e| Error::Generic(format!("Invalid Taproot output key: {e}")))?;
+
+        let mut keypair = Keypair::from_seckey_slice(&lwk_wollet::EC, secret_key)
+            .map_err(|e| Error::Generic(format!("Invalid private key: {e}")))?;
+        let result = (|| {
+            if keypair.x_only_public_key().0 != output_key {
+                return Err(Error::Generic(format!(
+                    "Secret key does not match the Taproot output key of input {index}"
+                )));
+            }
+
+            let tx = self
+                .inner
+                .extract_tx()
+                .map_err(|e| Error::Generic(format!("extract_tx error before sign: {e}")))?;
+            let mut sighash_cache = lwk_wollet::elements::sighash::SighashCache::new(&tx);
+            let genesis_hash = lwk_common::get_genesis_hash(&self.inner);
+            let msg = self
+                .inner
+                .sighash_msg(index, &mut sighash_cache, None, genesis_hash)
+                .map_err(|e| Error::Generic(format!("sighash_msg error: {e}")))?
+                .to_secp_msg();
+            let sig = lwk_wollet::EC.sign_schnorr(&msg, &keypair);
+            lwk_wollet::EC
+                .verify_schnorr(&sig, &msg, &output_key)
+                .map_err(|e| Error::Generic(format!("Schnorr self-verification failed: {e}")))?;
+            Ok(sig)
+        })();
+        keypair.non_secure_erase();
+
+        self.inner.inputs_mut()[index].final_script_witness = Some(vec![result?.as_ref().to_vec()]);
         Ok(())
     }
 }
