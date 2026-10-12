@@ -1,4 +1,5 @@
 use crate::{AssetId, Error, Issuance, Script, Transaction, Txid, Wollet};
+use lwk_wollet::elements_miniscript::psbt::PsbtExt;
 #[cfg(feature = "simplicity")]
 use crate::{ContractHash, LockTime, OutPoint, PublicKey, Tweak, TxOut, TxOutSecrets, TxSequence};
 
@@ -101,6 +102,34 @@ impl Pset {
     #[wasm_bindgen(js_name = addDetails)]
     pub fn add_details(&mut self, wollet: &Wollet) -> Result<(), Error> {
         wollet.inner().add_details(&mut self.inner)?;
+        Ok(())
+    }
+
+    /// Sign a Taproot key-path input by index with a 32-byte secret key.
+    #[wasm_bindgen(js_name = signTaprootKeypath)]
+    pub fn sign_taproot_keypath(&mut self, index: usize, secret_key: &[u8]) -> Result<(), Error> {
+        if index >= self.inner.inputs().len() {
+            return Err(Error::Generic(format!("Input index {index} out of bounds")));
+        }
+        let keypair = lwk_wollet::elements::secp256k1_zkp::Keypair::from_seckey_slice(
+            &lwk_wollet::EC,
+            secret_key,
+        )
+        .map_err(|e| Error::Generic(format!("Invalid private key: {e}")))?;
+
+        let tx = self
+            .inner
+            .extract_tx()
+            .map_err(|e| Error::Generic(format!("extract_tx error before sign: {e}")))?;
+        let mut sighash_cache = lwk_wollet::elements::sighash::SighashCache::new(&tx);
+        let genesis_hash = lwk_common::get_genesis_hash(&self.inner);
+        let msg = self
+            .inner
+            .sighash_msg(index, &mut sighash_cache, None, genesis_hash)
+            .map_err(|e| Error::Generic(format!("sighash_msg error: {e}")))?;
+        let secp_msg = msg.to_secp_msg();
+        let sig = lwk_wollet::EC.sign_schnorr(&secp_msg, &keypair);
+        self.inner.inputs_mut()[index].final_script_witness = Some(vec![sig.as_ref().to_vec()]);
         Ok(())
     }
 }

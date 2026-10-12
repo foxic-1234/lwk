@@ -109,15 +109,6 @@ impl TxOut {
             .map(Into::into)?)
     }
 
-    /// Unblind the output using 32-byte private blinding key
-    #[wasm_bindgen(js_name = unblindWithPrivateKey)]
-    pub fn unblind_with_private_key(&self, key_bytes: &[u8]) -> Result<TxOutSecrets, Error> {
-        let sk = lwk_wollet::elements::bitcoin::secp256k1::SecretKey::from_slice(key_bytes)?;
-        Ok(self
-            .inner
-            .unblind(&lwk_wollet::EC, sk)
-            .map(Into::into)?)
-    }
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]

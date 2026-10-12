@@ -27,7 +27,6 @@ impl From<&TxOutSecrets> for elements::TxOutSecrets {
     }
 }
 
-#[cfg(feature = "simplicity")]
 #[wasm_bindgen]
 impl TxOutSecrets {
     /// Creates a new `TxOutSecrets` with the given asset, blinding factors, and value.
