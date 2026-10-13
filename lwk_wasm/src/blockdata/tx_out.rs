@@ -101,14 +101,15 @@ impl TxOut {
         elements::Address::from_script(&self.inner.script_pubkey, None, params).map(|a| a.into())
     }
 
-    /// Unblind the output using the given secret key
+    /// Unblind the output using the given secret key.
+    ///
+    /// Not gated on `simplicity`: Humid unblinds ELIP-352 Silent Payment outputs with it.
     pub fn unblind(&self, secret_key: &SecretKey) -> Result<TxOutSecrets, Error> {
         Ok(self
             .inner
             .unblind(&lwk_wollet::EC, secret_key.into())
             .map(Into::into)?)
     }
-
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]

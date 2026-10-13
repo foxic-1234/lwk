@@ -44,7 +44,6 @@ mod signer;
 mod store;
 #[cfg(feature = "simplicity")]
 mod tweak;
-mod sweep;
 mod tx_builder;
 mod tx_details;
 mod update;
@@ -125,7 +124,6 @@ pub use registry::{AssetMeta, Registry, RegistryPost};
 pub use secret_key::SecretKey;
 pub use signer::Signer;
 pub use store::{JsStorage, JsStoreLink, JsTestStore};
-pub use sweep::*;
 #[cfg(feature = "simplicity")]
 pub use tweak::Tweak;
 pub use tx_builder::TxBuilder;
