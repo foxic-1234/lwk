@@ -1,6 +1,7 @@
 use crate::{AssetId, Error, Issuance, Script, Transaction, Txid, Wollet};
 #[cfg(feature = "simplicity")]
 use crate::{ContractHash, LockTime, OutPoint, PublicKey, Tweak, TxOut, TxOutSecrets, TxSequence};
+use lwk_wollet::elements_miniscript::psbt::PsbtExt;
 
 #[cfg(feature = "simplicity")]
 use std::collections::HashMap;
@@ -103,6 +104,89 @@ impl Pset {
         wollet.inner().add_details(&mut self.inner)?;
         Ok(())
     }
+
+    /// Sign a BIP-341 key-path input by index with a 32-byte secret key.
+    ///
+    /// The input's `witness_utxo` must be a v1 P2TR output whose output key is `secret_key·G`
+    /// (no taptweak is applied: BIP-352 outputs commit to the key directly). The signature is
+    /// verified against that output key before the final witness is written.
+    ///
+    /// The PSET must carry the genesis block hash (ELIP-101), as PSETs built by `TxBuilder` do:
+    /// it is part of the Elements Taproot sighash.
+    #[wasm_bindgen(js_name = signTaprootKeypath)]
+    pub fn sign_taproot_keypath(&mut self, index: usize, secret_key: &[u8]) -> Result<(), Error> {
+        use lwk_wollet::elements::secp256k1_zkp::{Keypair, XOnlyPublicKey};
+
+        let input = self
+            .inner
+            .inputs()
+            .get(index)
+            .ok_or_else(|| Error::Generic(format!("Input index {index} out of bounds")))?;
+        let spk = &input
+            .witness_utxo
+            .as_ref()
+            .ok_or_else(|| Error::Generic(format!("Input {index} has no witness_utxo")))?
+            .script_pubkey;
+        if !spk.is_v1_p2tr() {
+            return Err(Error::Generic(format!(
+                "Input {index} is not a v1 P2TR output"
+            )));
+        }
+        let output_key = XOnlyPublicKey::from_slice(&spk.as_bytes()[2..34])
+            .map_err(|e| Error::Generic(format!("Invalid Taproot output key: {e}")))?;
+        let genesis_hash = pset_genesis_hash(&self.inner)?;
+
+        let mut keypair = Keypair::from_seckey_slice(&lwk_wollet::EC, secret_key)
+            .map_err(|e| Error::Generic(format!("Invalid private key: {e}")))?;
+        let result = (|| {
+            if keypair.x_only_public_key().0 != output_key {
+                return Err(Error::Generic(format!(
+                    "Secret key does not match the Taproot output key of input {index}"
+                )));
+            }
+
+            let tx = self
+                .inner
+                .extract_tx()
+                .map_err(|e| Error::Generic(format!("extract_tx error before sign: {e}")))?;
+            let mut sighash_cache = lwk_wollet::elements::sighash::SighashCache::new(&tx);
+            let msg = self
+                .inner
+                .sighash_msg(index, &mut sighash_cache, None, genesis_hash)
+                .map_err(|e| Error::Generic(format!("sighash_msg error: {e}")))?
+                .to_secp_msg();
+            let sig = lwk_wollet::EC.sign_schnorr(&msg, &keypair);
+            lwk_wollet::EC
+                .verify_schnorr(&sig, &msg, &output_key)
+                .map_err(|e| Error::Generic(format!("Schnorr self-verification failed: {e}")))?;
+            Ok(sig)
+        })();
+        keypair.non_secure_erase();
+
+        self.inner.inputs_mut()[index].final_script_witness = Some(vec![result?.as_ref().to_vec()]);
+        Ok(())
+    }
+}
+
+/// Read the genesis block hash from the PSET global proprietary field (ELIP-101).
+///
+/// Fails rather than defaulting to zeros: a wrong genesis hash yields a signature that passes
+/// self-verification against the same sighash yet is invalid on chain.
+fn pset_genesis_hash(
+    pset: &PartiallySignedTransaction,
+) -> Result<lwk_wollet::elements::BlockHash, Error> {
+    use lwk_wollet::elements::hashes::Hash as _;
+    use lwk_wollet::elements::pset::raw::ProprietaryKey;
+
+    const PSBT_ELEMENTS_GLOBAL_GENESIS_HASH: u8 = 0x02;
+    let key = ProprietaryKey::from_pset_pair(PSBT_ELEMENTS_GLOBAL_GENESIS_HASH, vec![]);
+    let bytes: [u8; 32] = pset
+        .global
+        .proprietary
+        .get(&key)
+        .and_then(|v| v.as_slice().try_into().ok())
+        .ok_or_else(|| Error::Generic("PSET has no genesis block hash (ELIP-101)".to_string()))?;
+    Ok(lwk_wollet::elements::BlockHash::from_byte_array(bytes))
 }
 
 #[cfg(feature = "simplicity")]
@@ -492,6 +576,121 @@ impl PsetBuilder {
     /// Build the Pset, consuming the builder
     pub fn build(self) -> Pset {
         Pset::from(self.inner)
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod taproot_keypath_tests {
+    use super::*;
+    use lwk_wollet::elements::confidential::{Asset, Nonce, Value};
+    #[allow(unused_imports)] // also imported by `super::*` under the `simplicity` feature
+    use lwk_wollet::elements::hashes::Hash as _;
+    use lwk_wollet::elements::pset::raw::ProprietaryKey;
+    use lwk_wollet::elements::secp256k1_zkp::{schnorr, Keypair, Message};
+    use lwk_wollet::elements::sighash::SighashCache;
+    use lwk_wollet::elements::{self, AssetId as ElementsAssetId, OutPoint, TxOut, TxOutWitness};
+
+    const SECRET: [u8; 32] = [7u8; 32];
+
+    fn p2tr_pset(secret: &[u8; 32], with_genesis: bool) -> Pset {
+        let keypair = Keypair::from_seckey_slice(&lwk_wollet::EC, secret).unwrap();
+        let mut spk = vec![0x51, 0x20];
+        spk.extend_from_slice(&keypair.x_only_public_key().0.serialize());
+        let asset = Asset::Explicit(ElementsAssetId::from_slice(&[1u8; 32]).unwrap());
+
+        let mut pset = PartiallySignedTransaction::new_v2();
+        let mut input = Input::from_prevout(OutPoint::new(elements::Txid::all_zeros(), 0));
+        input.witness_utxo = Some(TxOut {
+            asset,
+            value: Value::Explicit(10_000),
+            nonce: Nonce::Null,
+            script_pubkey: elements::Script::from(spk),
+            witness: TxOutWitness::default(),
+        });
+        pset.add_input(input);
+        pset.add_output(Output::from_txout(TxOut {
+            asset,
+            value: Value::Explicit(10_000),
+            nonce: Nonce::Null,
+            script_pubkey: elements::Script::new(),
+            witness: TxOutWitness::default(),
+        }));
+        if with_genesis {
+            pset.global.proprietary.insert(
+                ProprietaryKey::from_pset_pair(0x02, vec![]),
+                lwk_common::Network::TestnetLiquid
+                    .genesis_hash()
+                    .to_byte_array()
+                    .to_vec(),
+            );
+        }
+        pset.into()
+    }
+
+    #[test]
+    fn signs_and_verifies_against_the_output_key() {
+        let mut pset = p2tr_pset(&SECRET, true);
+        pset.sign_taproot_keypath(0, &SECRET).unwrap();
+
+        let inner = pset.inner();
+        let witness = inner.inputs()[0].final_script_witness.as_ref().unwrap();
+        assert_eq!(witness.len(), 1);
+        assert_eq!(
+            witness[0].len(),
+            64,
+            "default sighash: bare 64-byte BIP-340 signature"
+        );
+
+        let tx = inner.extract_tx().unwrap();
+        let mut cache = SighashCache::new(&tx);
+        let genesis = lwk_common::Network::TestnetLiquid.genesis_hash();
+        let msg: Message = inner
+            .sighash_msg(0, &mut cache, None, genesis)
+            .unwrap()
+            .to_secp_msg();
+        let key = Keypair::from_seckey_slice(&lwk_wollet::EC, &SECRET)
+            .unwrap()
+            .x_only_public_key()
+            .0;
+        let sig = schnorr::Signature::from_slice(&witness[0]).unwrap();
+        lwk_wollet::EC.verify_schnorr(&sig, &msg, &key).unwrap();
+    }
+
+    #[test]
+    fn refuses_a_pset_without_genesis_hash() {
+        let mut pset = p2tr_pset(&SECRET, false);
+        let err = pset.sign_taproot_keypath(0, &SECRET).unwrap_err();
+        assert!(err.to_string().contains("genesis"), "{err}");
+        assert!(pset.inner().inputs()[0].final_script_witness.is_none());
+    }
+
+    #[test]
+    fn refuses_a_key_that_does_not_match_the_output() {
+        let mut pset = p2tr_pset(&SECRET, true);
+        let err = pset.sign_taproot_keypath(0, &[8u8; 32]).unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+        assert!(pset.inner().inputs()[0].final_script_witness.is_none());
+    }
+
+    #[test]
+    fn refuses_a_non_taproot_input_and_an_out_of_range_index() {
+        let mut pset = p2tr_pset(&SECRET, true);
+        assert!(pset.sign_taproot_keypath(1, &SECRET).is_err());
+
+        let mut inner: PartiallySignedTransaction = pset.into();
+        inner.inputs_mut()[0]
+            .witness_utxo
+            .as_mut()
+            .unwrap()
+            .script_pubkey = elements::Script::from(
+            vec![0x00, 0x14]
+                .into_iter()
+                .chain([0u8; 20])
+                .collect::<Vec<u8>>(),
+        );
+        let mut pset: Pset = inner.into();
+        let err = pset.sign_taproot_keypath(0, &SECRET).unwrap_err();
+        assert!(err.to_string().contains("not a v1 P2TR"), "{err}");
     }
 }
 
